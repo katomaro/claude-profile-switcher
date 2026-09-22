@@ -86,9 +86,15 @@ This uses `diskpart` to recreate the VHDX file. A UAC admin prompt will appear �
 
 Make sure Claude Desktop is **fully closed** before switching (not just minimized). The script will prompt you to right-click the tray icon → Exit.
 
+The Claude data directory is detected automatically for both **Microsoft Store / MSIX** installs (`%LOCALAPPDATA%\Packages\<pkg>\LocalCache\Roaming\Claude`) and **standalone** installs (`%APPDATA%\Claude`). The script prints the resolved path at startup (`[i] Claude data dir: ...`) — if that path looks wrong or is reported missing, launch Claude and log in first.
+
+### Script hangs at "waiting for Claude to exit"
+
+Fixed. Earlier versions also waited for the Hyper-V worker process (`vmwp`) to disappear, which never happens while **WSL2, Docker Desktop, Windows Sandbox, or any other VM** is running — so the switch could hang forever. The script now waits only on the Claude process (with a timeout) and never touches Hyper-V services or other VMs.
+
 ### "cannot be loaded because running scripts is disabled"
 
-Run this once in an admin PowerShell:
+Run this once in PowerShell (no admin needed — `-Scope CurrentUser` writes to your own profile):
 
 ```powershell
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser

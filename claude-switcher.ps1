@@ -17,7 +17,34 @@ param(
 )
 
 # === Config ===
-$claudeDir = "$env:APPDATA\Claude"
+# Resolve the Claude Desktop data directory. Works for BOTH install types:
+#   - Standalone installer:   %APPDATA%\Claude
+#   - Microsoft Store / MSIX:  %LOCALAPPDATA%\Packages\<PackageFamilyName>\LocalCache\Roaming\Claude
+# The MSIX package family name is derived dynamically (never hardcoded) via the
+# same Get-AppxPackage call Start-Claude already uses, then we pick whichever
+# candidate actually holds the live login (config.json). On modern MSIX both
+# paths resolve to the same physical files, so either works.
+function Resolve-ClaudeDir {
+    $candidates = @()
+    $pkg = Get-AppxPackage -Name "Claude" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pkg) {
+        $candidates += "$env:LOCALAPPDATA\Packages\$($pkg.PackageFamilyName)\LocalCache\Roaming\Claude"
+    }
+    $candidates += "$env:APPDATA\Claude"
+
+    # Prefer a candidate that actually contains the live login.
+    foreach ($c in $candidates) {
+        if (Test-Path (Join-Path $c "config.json")) { return $c }
+    }
+    # Otherwise prefer one that at least exists as a directory.
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { return $c }
+    }
+    # Fall back to the standalone location so error messages point somewhere sane.
+    return "$env:APPDATA\Claude"
+}
+
+$claudeDir   = Resolve-ClaudeDir
 $instanceDir = "$env:USERPROFILE\.claude-instances"
 $currentFile = "$instanceDir\_current_profile"
 
@@ -105,37 +132,47 @@ function Load-Session {
 }
 
 function Stop-ClaudeGracefully {
+    param([int]$TimeoutSeconds = 600)
+
     Write-Host ""
     $claude = Get-Process -Name "Claude" -ErrorAction SilentlyContinue
     if (-not $claude) {
         Write-OK "Claude Desktop is not running"
         return $true
     }
-    
+
     Write-Warn "Please close Claude Desktop manually:"
     Write-Warn "  RIGHT-CLICK system tray icon -> Exit"
-    Write-Info "Waiting for Claude to exit... (no timeout)"
+    Write-Info "Waiting for Claude to exit... (timeout: ${TimeoutSeconds}s)"
     Write-Host ""
-    
+
+    # We wait ONLY on the Claude process tree, NOT on 'vmwp'.
+    # 'vmwp' (Hyper-V VM Worker Process) is shared system-wide: Windows runs one
+    # per VM, so WSL2, Docker Desktop, Windows Sandbox, and any Hyper-V guest each
+    # keep their own vmwp alive. Gating on "no vmwp" hangs forever on any machine
+    # running another VM (the reported MSIX/"waiting for Claude to exit" hang).
+    # The session files we swap are held by Claude.exe, not vmwp; vm_bundles (the
+    # only disk vmwp locks) is never swapped, so its lock is irrelevant here.
     $elapsed = 0
     while ($true) {
-        Start-Sleep -Seconds 1
-        $elapsed++
-        
-        $cAlive = [bool](Get-Process -Name "Claude" -ErrorAction SilentlyContinue)
-        $vAlive = [bool](Get-Process -Name "vmwp" -ErrorAction SilentlyContinue)
-        
-        if (-not $cAlive -and -not $vAlive) {
-            Write-OK "Claude + VM exited cleanly (${elapsed}s)"
+        if (-not (Get-Process -Name "Claude" -ErrorAction SilentlyContinue)) {
+            Write-OK "Claude exited cleanly (${elapsed}s)"
+            # Brief settle so Electron/Chromium release file handles before we copy.
             Start-Sleep -Seconds 2
             return $true
         }
-        
+
+        if ($elapsed -ge $TimeoutSeconds) {
+            Write-Err "Timed out after ${TimeoutSeconds}s waiting for Claude to exit."
+            Write-Err "Close Claude Desktop fully (tray -> Exit) and re-run."
+            return $false
+        }
+
+        Start-Sleep -Seconds 1
+        $elapsed++
+
         if ($elapsed % 30 -eq 0) {
-            $status = ""
-            if ($cAlive) { $status += "Claude " }
-            if ($vAlive) { $status += "vmwp " }
-            Write-Info "${elapsed}s - still waiting for: $status"
+            Write-Info "${elapsed}s - still waiting for Claude to close..."
         }
     }
 }
@@ -272,6 +309,14 @@ Write-Host "  Claude Profile Switcher v1.0.0" -ForegroundColor White
 Write-Host "  github.com/NeezerGu/claude-profile-switcher" -ForegroundColor DarkGray
 
 if (!(Test-Path $instanceDir)) { New-Item -ItemType Directory -Path $instanceDir -Force | Out-Null }
+
+# Show which Claude data store we resolved, so MSIX vs standalone is never a mystery.
+if (Test-Path $claudeDir) {
+    Write-Info "Claude data dir: $claudeDir"
+} else {
+    Write-Warn "Claude data dir not found: $claudeDir"
+    Write-Warn "  Install/launch Claude Desktop and log in first."
+}
 
 switch ($Action.ToLower()) {
     "list" {
