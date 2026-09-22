@@ -6,14 +6,19 @@
     to switch between different Claude accounts without re-logging in.
     Keeps vm_bundles (12GB+ Cowork VM) shared across profiles.
 .NOTES
-    Version: 1.0.0
+    Version: 1.1.0
     Requires: Windows 10/11, Claude Desktop 1.1.x+ (Microsoft Store or standalone installer)
     Admin may be needed for Cowork VM sessiondata repair (diskpart)
+    -Force auto-closes Claude and cycles CoworkVMService (the latter needs admin)
 #>
 
 param(
     [Parameter(Position=0)] [string]$Action = "list",
-    [Parameter(Position=1)] [string]$Name = ""
+    [Parameter(Position=1)] [string]$Name = "",
+    # Force path: force-close Claude and cycle Claude's own Cowork VM service
+    # (CoworkVMService) instead of asking you to close Claude by hand. Cycling
+    # the service needs admin; without elevation it force-closes Claude only.
+    [switch]$Force
 )
 
 # === Config ===
@@ -177,6 +182,81 @@ function Stop-ClaudeGracefully {
     }
 }
 
+# Tracks whether WE stopped Claude's Cowork VM service, so we only ever restart
+# what this run stopped (never touch a service the user is managing themselves).
+$script:CoworkSvcStopped = $false
+
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
+        [Security.Principal.WindowsBuiltinRole]::Administrator)
+}
+
+function Stop-CoworkService {
+    # Stops CoworkVMService = Claude's OWN Cowork VM service (cowork-svc.exe).
+    # This is scoped to Claude only: it does NOT touch vmms, WSL2, Docker, or any
+    # other VM. It is the correct, safe alternative to the "Stop-Service vmms"
+    # some issue reports suggest. Requires admin (the service runs as LocalSystem).
+    $svc = Get-Service -Name "CoworkVMService" -ErrorAction SilentlyContinue
+    if (-not $svc -or $svc.Status -ne 'Running') { return }
+
+    if (-not (Test-IsAdmin)) {
+        Write-Warn "Not elevated - leaving CoworkVMService running."
+        Write-Warn "  Re-run from an admin PowerShell for the full --force cycle."
+        return
+    }
+    try {
+        Stop-Service -Name "CoworkVMService" -Force -ErrorAction Stop
+        $script:CoworkSvcStopped = $true
+        Write-OK "Stopped CoworkVMService (Claude's Cowork VM only)"
+    } catch {
+        Write-Warn "Could not stop CoworkVMService: $($_.Exception.Message)"
+    }
+}
+
+function Start-CoworkService {
+    # Restart the Cowork VM service only if THIS run stopped it.
+    if (-not $script:CoworkSvcStopped) { return }
+    try {
+        Start-Service -Name "CoworkVMService" -ErrorAction Stop
+        $script:CoworkSvcStopped = $false
+        Write-OK "Restarted CoworkVMService"
+    } catch {
+        Write-Warn "Could not restart CoworkVMService: $($_.Exception.Message)"
+        Write-Warn "  Start it manually: Start-Service CoworkVMService"
+    }
+}
+
+function Stop-ClaudeForceful {
+    # --force path: stop Claude's scoped Cowork VM service (if admin), then
+    # force-kill Claude. No manual tray-Exit, no waiting on other VMs.
+    Write-Host ""
+    Stop-CoworkService
+
+    if (Get-Process -Name "Claude" -ErrorAction SilentlyContinue) {
+        Stop-Process -Name "Claude" -Force -ErrorAction SilentlyContinue
+        Write-Warn "Force-closed Claude (unclean exit)."
+        Write-Info "  For a clean shutdown, switch without --force and close Claude via the tray."
+    } else {
+        Write-OK "Claude Desktop is not running"
+    }
+
+    # Confirm it is actually gone before we start swapping files.
+    $elapsed = 0
+    while ((Get-Process -Name "Claude" -ErrorAction SilentlyContinue) -and $elapsed -lt 30) {
+        Start-Sleep -Seconds 1
+        $elapsed++
+    }
+    if (Get-Process -Name "Claude" -ErrorAction SilentlyContinue) {
+        Write-Err "Claude still running after force-kill; aborting to avoid a torn swap."
+        Start-CoworkService   # leave the system as we found it
+        return $false
+    }
+
+    Start-Sleep -Seconds 2
+    return $true
+}
+
 function Repair-CoworkVM {
     # Cowork runs in a Hyper-V VM that needs sessiondata.vhdx
     # If this file is missing, VM fails with "HCS operation failed" error
@@ -228,8 +308,8 @@ function Start-Claude {
 }
 
 function Switch-Profile {
-    param([string]$target)
-    
+    param([string]$target, [bool]$ForceClose)
+
     $current = Get-CurrentProfile
     $targetDir = "$instanceDir\$target"
     
@@ -248,11 +328,11 @@ function Switch-Profile {
     Write-Host "  Switching: $current -> $target" -ForegroundColor Cyan
     Write-Host "  ========================================"
     
-    # Step 1: Close Claude
-    $closed = Stop-ClaudeGracefully
+    # Step 1: Close Claude (force path stops Claude's scoped Cowork service too)
+    if ($ForceClose) { $closed = Stop-ClaudeForceful } else { $closed = Stop-ClaudeGracefully }
     if (-not $closed) { return }
     Stop-Process -Name "chrome-native-host" -Force -ErrorAction SilentlyContinue
-    
+
     # Step 2: Save current session
     if ($current) {
         Save-Session $current
@@ -265,12 +345,15 @@ function Switch-Profile {
     
     # Step 4: Ensure Cowork VM sessiondata exists
     Repair-CoworkVM
-    
-    # Step 5: Update marker
+
+    # Step 5: Restart Claude's Cowork VM service if the --force path stopped it
+    Start-CoworkService
+
+    # Step 6: Update marker
     Set-Content -Path $currentFile -Value $target -NoNewline
     Write-OK "Profile set to '$target'"
-    
-    # Step 6: Launch
+
+    # Step 7: Launch
     Write-Host ""
     Write-Info "Starting Claude Desktop..."
     Start-Claude
@@ -280,24 +363,26 @@ function Switch-Profile {
 }
 
 function New-Profile {
-    param([string]$name)
-    
+    param([string]$name, [bool]$ForceClose)
+
     $profileDir = "$instanceDir\$name"
     if (Test-Path "$profileDir\config.json") {
         Write-Warn "Profile '$name' already exists. Overwriting..."
     }
-    
+
     if (!(Test-Path "$claudeDir\config.json")) {
         Write-Err "No config.json found. Please login to Claude Desktop first."
         return
     }
-    
+
     # Must close Claude to copy locked files (Cookies etc)
-    $closed = Stop-ClaudeGracefully
+    if ($ForceClose) { $closed = Stop-ClaudeForceful } else { $closed = Stop-ClaudeGracefully }
     if (-not $closed) { return }
     Stop-Process -Name "chrome-native-host" -Force -ErrorAction SilentlyContinue
-    
+
     Save-Session $name
+    # Restart Claude's Cowork VM service if the --force path stopped it
+    Start-CoworkService
     Set-Content -Path $currentFile -Value $name -NoNewline
     Write-OK "Created profile '$name' from current login"
     Write-OK "Active profile set to '$name'"
@@ -305,7 +390,7 @@ function New-Profile {
 
 # === Main ===
 Write-Host ""
-Write-Host "  Claude Profile Switcher v1.0.0" -ForegroundColor White
+Write-Host "  Claude Profile Switcher v1.1.0" -ForegroundColor White
 Write-Host "  github.com/NeezerGu/claude-profile-switcher" -ForegroundColor DarkGray
 
 if (!(Test-Path $instanceDir)) { New-Item -ItemType Directory -Path $instanceDir -Force | Out-Null }
@@ -341,12 +426,12 @@ switch ($Action.ToLower()) {
         else { Write-Info "No profile set" }
     }
     "switch" {
-        if (!$Name) { Write-Err "Usage: .\claude-switcher.ps1 switch <profile>"; return }
-        Switch-Profile $Name
+        if (!$Name) { Write-Err "Usage: .\claude-switcher.ps1 switch <profile> [-Force]"; return }
+        Switch-Profile $Name $Force.IsPresent
     }
     "create" {
-        if (!$Name) { Write-Err "Usage: .\claude-switcher.ps1 create <name>"; return }
-        New-Profile $Name
+        if (!$Name) { Write-Err "Usage: .\claude-switcher.ps1 create <name> [-Force]"; return }
+        New-Profile $Name $Force.IsPresent
     }
     "repair" {
         Write-Info "Checking Cowork VM..."
@@ -362,6 +447,10 @@ switch ($Action.ToLower()) {
         Write-Host "    list            - List all profiles"
         Write-Host "    current         - Show active profile"
         Write-Host "    repair          - Fix Cowork VM if broken"
+        Write-Host ""
+        Write-Host "  Options:"
+        Write-Host "    -Force          - Auto-close Claude and cycle CoworkVMService"
+        Write-Host "                      instead of a manual tray-Exit (service cycle needs admin)"
         Write-Host ""
         Write-Host "  Quick Setup:"
         Write-Host "    1. Login to Account A in Claude Desktop"

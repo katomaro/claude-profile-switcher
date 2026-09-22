@@ -58,6 +58,21 @@ Claude Desktop is an Electron app that stores authentication in multiple browser
 | `current` | Show the active profile name |
 | `repair` | Fix Cowork VM if it breaks after switching |
 
+### `-Force` (optional, opt-in)
+
+By default `create`/`switch` ask you to close Claude yourself (right-click tray → Exit) — a clean shutdown that needs no admin. Add `-Force` to skip that:
+
+```powershell
+.\claude-switcher.ps1 switch work -Force
+```
+
+`-Force` force-closes Claude and cycles Claude's **own** Cowork VM service, `CoworkVMService` (`cowork-svc.exe`) — the correctly-scoped way to release/restart the Cowork VM. It never touches `vmms`, WSL2, Docker, or any other VM. Notes:
+
+- Cycling the service needs **admin** (it runs as LocalSystem). Without elevation, `-Force` still force-closes Claude but leaves the service running.
+- A forced close is an unclean Chromium shutdown; if a session DB ever misbehaves, switch without `-Force` for a clean exit.
+
+> ⚠️ Do **not** use `Stop-Service vmms` to stop the Cowork VM (as some guides suggest) — `vmms` is the system-wide Hyper-V manager and stopping it tears down **every** VM on the machine (WSL2, Docker, Sandbox). `CoworkVMService` is the Claude-scoped service.
+
 ## PowerShell Aliases (Optional)
 
 Add to your PowerShell profile (`$PROFILE`) for quick switching:
